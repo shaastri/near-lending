@@ -19,6 +19,7 @@ pub struct LendingContract {
     pub owner: AccountId,
     pub metadata: LazyOption<Metadata>,
     pub pool_id_by_lending_token: UnorderedMap<AccountId, u64>,
+    pub collaterals: UnorderedMap<AccountId, Collateral>,
     pub pools: Vector<LendingPool>,
     pub pool_count: u64,
 }
@@ -40,6 +41,7 @@ impl LendingContract {
                     ),
                 }),
             ),
+            collaterals: UnorderedMap::new(b"collaterals".to_vec()),
             pool_id_by_lending_token: UnorderedMap::new(b"pool_id_by_lending_token".to_vec()),
             pools: Vector::new(b"pools".to_vec()),
             pool_count: 0,
@@ -65,8 +67,8 @@ impl LendingContract {
             interest_rate: interest_rate,
             pool_supply: 0,
             amount_borrowed: 0,
-            borrowers: UnorderedMap::new(b"borrowers".to_vec()),
-            lenders: UnorderedMap::new(b"lenders".to_vec()),
+            borrowers: UnorderedMap::new(format!("{}borrowers", lending_token).as_bytes()),
+            lenders: UnorderedMap::new(format!("{}lenders", lending_token).as_bytes()),
             total_share: 0,
             reward_per_share: 0,
             lastest_reward_time: env::block_timestamp(),
@@ -77,9 +79,7 @@ impl LendingContract {
         self.pool_count += 1;
     }
 
-    #[payable]
-    pub fn borrow(&mut self, pool_id: u64, amount: U128) -> Promise {
-        assert_one_yocto();
+    fn borrow(&mut self, borrower: ValidAccountId, pool_id: u64, amount: U128) -> Promise {
         let pool = &self.pools.get(pool_id).expect(ERR_NO_POOL);
         assert!(
             Balance::from(amount) <= pool.pool_supply,
@@ -87,7 +87,7 @@ impl LendingContract {
         );
         assert_one_yocto();
         ft_contract::ft_transfer(
-            ValidAccountId::try_from(env::predecessor_account_id()).unwrap(),
+            borrower.clone(),
             amount,
             None,
             &pool.lending_token,
@@ -96,7 +96,7 @@ impl LendingContract {
         )
         .then(self_contract::update_borrower(
             pool_id,
-            env::predecessor_account_id(),
+            borrower.into(),
             amount,
             &env::current_account_id(),
             0,
@@ -281,8 +281,17 @@ impl FungibleTokenReceiver for LendingContract {
                 let refund = pool.repay(sender_id.into(), amount.into());
                 self.pools.replace(pool_id, &pool);
                 PromiseOrValue::Value(U128::from(refund))
-            } else {
-                PromiseOrValue::Value(U128::from(amount))
+            }
+             else {
+                let call_data: Vec<&str> = msg.split("|").collect() ;
+                    if call_data.len() == 2{
+
+                        self.borrow(sender_id,0, U128::from(100));
+                        PromiseOrValue::Value(U128::from(0))
+                    } else{
+                        PromiseOrValue::Value(U128::from(amount))
+
+                    }
             }
         }
     }
@@ -311,6 +320,13 @@ pub struct PoolMetadata {
     pub reward_per_share: Balance,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(crate = "near_sdk::serde")]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct Collateral{
+    collateral_id: AccountId, 
+    amount: Balance,
+}
 // #[cfg(all(test, not(target_arch = "wasm32")))]
 // mod tests {
 //     use near_sdk::test_utils::{accounts, VMContextBuilder};

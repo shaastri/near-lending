@@ -30,7 +30,7 @@ pub struct Loan {
 pub struct LenderInfo {
     share: Share,
     reward_debt: Balance,
-    claimed: Balance,
+    acc_reward: Balance,
 }
 
 impl LendingPool {
@@ -55,13 +55,14 @@ impl LendingPool {
         let mut lender = self.lenders.get(&lender_id).unwrap_or(LenderInfo {
             share: 0,
             reward_debt: 0,
-            claimed: 0,
+            acc_reward: 0,
         });
+        if amount > 0 {
+            let pending = self.reward_per_share * lender.share / SHARE_DIVISOR - lender.reward_debt;
+            lender.acc_reward += pending;
+        }
         lender.reward_debt = self.reward_per_share * lender.share / SHARE_DIVISOR;
         lender.share += amount;
-        if lender.share == amount {
-            lender.claimed = lender.reward_debt;
-        }
         self.lenders.insert(&lender_id, &lender);
         self.pool_supply += amount;
         self.total_share += amount;
@@ -104,12 +105,12 @@ impl LendingPool {
             amount >= amount * interest / SHARE_DIVISOR,
             "Amount repay must be greater than interest"
         );
-        if amount >= (borrower.amount +  amount * interest / SHARE_DIVISOR) {
-            self.pool_supply += borrower.amount +  amount * interest / SHARE_DIVISOR;
+        if amount >= (borrower.amount + amount * interest / SHARE_DIVISOR) {
+            self.pool_supply += borrower.amount + amount * interest / SHARE_DIVISOR;
             self.borrowers.remove(&borrower_id);
-            amount - (borrower.amount +  amount * interest / SHARE_DIVISOR)
+            amount - (borrower.amount + amount * interest / SHARE_DIVISOR)
         } else {
-            borrower.amount -= (amount -  amount * interest / SHARE_DIVISOR);
+            borrower.amount -= (amount - amount * interest / SHARE_DIVISOR);
             borrower.loan_start_time = env::block_timestamp();
             self.pool_supply += amount;
             self.borrowers.insert(&borrower_id, &borrower);
@@ -120,11 +121,13 @@ impl LendingPool {
     pub fn claim_reward(&mut self, lender_id: AccountId) -> Promise {
         self.update_pool();
         let mut lender = self.lenders.get(&lender_id).expect("Nothing to claim");
-        lender.reward_debt = self.reward_per_share * lender.share / SHARE_DIVISOR;
         self.lenders.insert(&lender_id, &lender);
         ft_contract::ft_transfer(
             ValidAccountId::try_from(lender_id.clone()).unwrap(),
-            U128::from(lender.reward_debt - lender.claimed),
+            U128::from(
+                self.reward_per_share * lender.share / SHARE_DIVISOR - lender.reward_debt
+                    + lender.acc_reward,
+            ),
             None,
             &self.lending_token,
             1,
@@ -141,16 +144,16 @@ impl LendingPool {
 
     pub fn withdraw(&mut self, lender_id: AccountId, amount: Balance) -> Promise {
         self.update_pool();
-        let mut lender = self.lenders.get(&lender_id).expect("Nothing to claim");
+        let lender = self.lenders.get(&lender_id).expect("Nothing to claim");
         assert!(
             amount <= lender.share,
             "Amount withdraw is greater than your deposit"
         );
-        lender.reward_debt = self.reward_per_share * lender.share / SHARE_DIVISOR;
-        self.lenders.insert(&lender_id, &lender);
         ft_contract::ft_transfer(
             ValidAccountId::try_from(lender_id.clone()).unwrap(),
-            U128::from(amount + lender.reward_debt - lender.claimed),
+            U128::from(
+                amount + self.reward_per_share * lender.share / SHARE_DIVISOR - lender.reward_debt + lender.acc_reward,
+            ),
             None,
             &self.lending_token,
             1,
@@ -168,22 +171,26 @@ impl LendingPool {
 
     pub fn update_lender_withdraw(&mut self, lender_id: AccountId, amount: Balance) {
         let mut lender = self.lenders.get(&lender_id).unwrap();
-        self.pool_supply -= amount + lender.reward_debt - lender.claimed;
-        lender.claimed = lender.reward_debt;
+        self.pool_supply -= amount + self.reward_per_share * lender.share / SHARE_DIVISOR - lender.reward_debt + lender.acc_reward;
+        lender.acc_reward = 0;
         lender.share -= amount;
+        lender.reward_debt = self.reward_per_share * lender.share / SHARE_DIVISOR;
         self.total_share -= amount;
         self.lenders.insert(&lender_id, &lender);
     }
 
     pub fn update_lender_claim(&mut self, lender_id: AccountId) {
         let mut lender = self.lenders.get(&lender_id).unwrap();
-        self.pool_supply -= lender.reward_debt - lender.claimed;
-        lender.claimed = lender.reward_debt;
+        self.pool_supply -= self.reward_per_share * lender.share / SHARE_DIVISOR
+            - lender.reward_debt
+            + lender.acc_reward;
+        lender.reward_debt = self.reward_per_share * lender.share / SHARE_DIVISOR;
+        lender.acc_reward = 0;
         self.lenders.insert(&lender_id, &lender);
     }
 
     pub fn amount_claimable(&self, lender_id: AccountId) -> Balance {
-        if let lender = self.lenders.get(&lender_id).unwrap() {
+        if let Some(lender) = self.lenders.get(&lender_id) {
             let pendding_reward = self.borrowers.values().fold(0, |acc, borrower| {
                 acc + ((env::block_timestamp() - self.lastest_reward_time) / ONE_DAY) as Balance
                     * borrower.amount
@@ -193,7 +200,7 @@ impl LendingPool {
             });
             let reward_per_share =
                 self.reward_per_share + pendding_reward / (self.total_share / SHARE_DIVISOR);
-            reward_per_share * lender.share / SHARE_DIVISOR - lender.claimed
+            reward_per_share * lender.share / SHARE_DIVISOR + lender.acc_reward
         } else {
             0
         }
