@@ -1,4 +1,6 @@
-use crate::contract_const::{Share, INTEREST_DIVISOR, ONE_DAY, SHARE_DIVISOR};
+use crate::contract_const::{
+    Share, ERR_NO_BORROWER, INTEREST_DIVISOR, MAX_BORROW_RATE, ONE_DAY, SHARE_DIVISOR,
+};
 use crate::*;
 
 #[near_bindgen]
@@ -6,6 +8,7 @@ use crate::*;
 pub struct LendingPool {
     pub pool_id: u64,
     pub lending_token: AccountId,
+    pub collateral_token: AccountId,
     pub interest_rate: u64,
     pub pool_supply: Balance,
     pub amount_borrowed: Balance,
@@ -20,8 +23,10 @@ pub struct LendingPool {
 #[serde(crate = "near_sdk::serde")]
 #[derive(BorshDeserialize, BorshSerialize)]
 pub struct Loan {
+    borrower: AccountId,
     loan_start_time: Timestamp,
     amount: Balance,
+    amount_collateral: Balance,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -68,16 +73,25 @@ impl LendingPool {
         self.total_share += amount;
     }
 
+    pub fn mortgate(&mut self, borrower_id: AccountId, amount_collateral: Balance) -> Loan {
+        let mut borrower = self.borrowers.get(&borrower_id).unwrap_or(Loan {
+            borrower: env::predecessor_account_id(),
+            loan_start_time: env::block_timestamp(),
+            amount: 0u128,
+            amount_collateral: 0u128,
+        });
+        borrower.amount_collateral += amount_collateral;
+        self.borrowers.insert(&borrower_id, &borrower);
+        borrower
+    }
+
     pub fn borrow(&mut self, borrower_id: AccountId, amount: Balance) {
         assert!(
             amount <= self.pool_supply - self.amount_borrowed,
             "Dont enough token to borrow from pool"
         );
         self.update_pool();
-        let mut borrower = self.borrowers.get(&borrower_id).unwrap_or(Loan {
-            loan_start_time: env::block_timestamp(),
-            amount: 0u128,
-        });
+        let mut borrower = self.borrowers.get(&borrower_id).expect(ERR_NO_BORROWER);
         let interest = (SHARE_DIVISOR as u64
             * self.interest_rate
             * (env::block_timestamp() - borrower.loan_start_time)
@@ -120,7 +134,7 @@ impl LendingPool {
 
     pub fn claim_reward(&mut self, lender_id: AccountId) -> Promise {
         self.update_pool();
-        let mut lender = self.lenders.get(&lender_id).expect("Nothing to claim");
+        let lender = self.lenders.get(&lender_id).expect("Nothing to claim");
         self.lenders.insert(&lender_id, &lender);
         ft_contract::ft_transfer(
             ValidAccountId::try_from(lender_id.clone()).unwrap(),
@@ -152,7 +166,8 @@ impl LendingPool {
         ft_contract::ft_transfer(
             ValidAccountId::try_from(lender_id.clone()).unwrap(),
             U128::from(
-                amount + self.reward_per_share * lender.share / SHARE_DIVISOR - lender.reward_debt + lender.acc_reward,
+                amount + self.reward_per_share * lender.share / SHARE_DIVISOR - lender.reward_debt
+                    + lender.acc_reward,
             ),
             None,
             &self.lending_token,
@@ -171,7 +186,9 @@ impl LendingPool {
 
     pub fn update_lender_withdraw(&mut self, lender_id: AccountId, amount: Balance) {
         let mut lender = self.lenders.get(&lender_id).unwrap();
-        self.pool_supply -= amount + self.reward_per_share * lender.share / SHARE_DIVISOR - lender.reward_debt + lender.acc_reward;
+        self.pool_supply -= amount + self.reward_per_share * lender.share / SHARE_DIVISOR
+            - lender.reward_debt
+            + lender.acc_reward;
         lender.acc_reward = 0;
         lender.share -= amount;
         lender.reward_debt = self.reward_per_share * lender.share / SHARE_DIVISOR;
@@ -187,6 +204,22 @@ impl LendingPool {
         lender.reward_debt = self.reward_per_share * lender.share / SHARE_DIVISOR;
         lender.acc_reward = 0;
         self.lenders.insert(&lender_id, &lender);
+    }
+
+    pub fn get_list_liquidatable(&self, return_amount: Balance) -> Vec<Loan> {
+        //price: 10**24 collateral => return amount lending token
+        self.borrowers
+            .values()
+            .filter_map(|borrower| {
+                if borrower.amount
+                    > (borrower.amount_collateral * return_amount * MAX_BORROW_RATE / 100)
+                {
+                    Some(borrower)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     pub fn amount_claimable(&self, lender_id: AccountId) -> Balance {
