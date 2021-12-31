@@ -1,5 +1,6 @@
-use crate::contract_const::{
-    Share, ERR_NO_BORROWER, INTEREST_DIVISOR, MAX_BORROW_RATE, ONE_DAY, SHARE_DIVISOR,
+use crate::utils::{
+    Share, ERR_NO_BORROWER, INTEREST_DIVISOR, LIQUIDATE_THRESHOLD, MAX_BORROW_RATE, ONE_DAY,
+    SHARE_DIVISOR,
 };
 use crate::*;
 
@@ -9,6 +10,7 @@ pub struct LendingPool {
     pub pool_id: u64,
     pub lending_token: AccountId,
     pub collateral_token: AccountId,
+    pub ref_pool_ids: Vec<u64>, //[lending token pool id, collateral token pool id] - pool wnear - token
     pub interest_rate: u64,
     pub pool_supply: Balance,
     pub amount_borrowed: Balance,
@@ -23,10 +25,10 @@ pub struct LendingPool {
 #[serde(crate = "near_sdk::serde")]
 #[derive(BorshDeserialize, BorshSerialize)]
 pub struct Loan {
-    borrower: AccountId,
-    loan_start_time: Timestamp,
-    amount: Balance,
-    amount_collateral: Balance,
+    pub borrower: AccountId,
+    pub loan_start_time: Timestamp,
+    pub amount: Balance,
+    pub amount_collateral: Balance,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -44,14 +46,13 @@ impl LendingPool {
             self.lastest_reward_time = env::block_timestamp();
             return;
         }
-        let pendding_reward = self.borrowers.values().fold(0, |acc, borrower| {
-            acc + ((env::block_timestamp() - self.lastest_reward_time) / ONE_DAY) as Balance
-                * borrower.amount
-                * self.interest_rate as Balance
-                / 365
-                / INTEREST_DIVISOR as Balance
-        });
-        self.reward_per_share += pendding_reward / (self.total_share / SHARE_DIVISOR);
+        let pendding_reward = self
+            .borrowers
+            .values()
+            .fold(0, |acc, borrower| acc + self.get_interest(&borrower));
+        self.reward_per_share += (U256::from(pendding_reward) * U256::from(SHARE_DIVISOR)
+            / U256::from(self.total_share))
+        .as_u128();
         self.lastest_reward_time = env::block_timestamp();
     }
 
@@ -62,12 +63,12 @@ impl LendingPool {
             reward_debt: 0,
             acc_reward: 0,
         });
-        if amount > 0 {
+        if lender.share > 0 {
             let pending = self.reward_per_share * lender.share / SHARE_DIVISOR - lender.reward_debt;
             lender.acc_reward += pending;
         }
-        lender.reward_debt = self.reward_per_share * lender.share / SHARE_DIVISOR;
         lender.share += amount;
+        lender.reward_debt = self.reward_per_share * lender.share / SHARE_DIVISOR;
         self.lenders.insert(&lender_id, &lender);
         self.pool_supply += amount;
         self.total_share += amount;
@@ -75,12 +76,19 @@ impl LendingPool {
 
     pub fn mortgate(&mut self, borrower_id: AccountId, amount_collateral: Balance) -> Loan {
         let mut borrower = self.borrowers.get(&borrower_id).unwrap_or(Loan {
-            borrower: env::predecessor_account_id(),
+            borrower: borrower_id.clone(),
             loan_start_time: env::block_timestamp(),
             amount: 0u128,
             amount_collateral: 0u128,
         });
         borrower.amount_collateral += amount_collateral;
+        self.borrowers.insert(&borrower_id, &borrower);
+        borrower
+    }
+
+    pub fn withdraw_collateral(&mut self, borrower_id: AccountId, amount: Balance) -> Loan {
+        let mut borrower = self.borrowers.get(&borrower_id).expect(ERR_NO_BORROWER);
+        borrower.amount_collateral -= amount;
         self.borrowers.insert(&borrower_id, &borrower);
         borrower
     }
@@ -92,13 +100,8 @@ impl LendingPool {
         );
         self.update_pool();
         let mut borrower = self.borrowers.get(&borrower_id).expect(ERR_NO_BORROWER);
-        let interest = (SHARE_DIVISOR as u64
-            * self.interest_rate
-            * (env::block_timestamp() - borrower.loan_start_time)
-            / ONE_DAY
-            / 365
-            / INTEREST_DIVISOR) as Balance;
-        borrower.amount += amount + amount * interest / SHARE_DIVISOR;
+        let interest = self.get_interest(&borrower);
+        borrower.amount += amount + interest / SHARE_DIVISOR;
         self.pool_supply -= amount;
         self.borrowers.insert(&borrower_id, &borrower);
     }
@@ -109,22 +112,17 @@ impl LendingPool {
             .borrowers
             .get(&borrower_id)
             .expect("You have not borrowed anything yet");
-        let interest = (SHARE_DIVISOR as u64
-            * self.interest_rate
-            * (env::block_timestamp() - borrower.loan_start_time)
-            / ONE_DAY
-            / 365
-            / INTEREST_DIVISOR) as Balance;
+        let interest = self.get_interest(&borrower);
         assert!(
-            amount >= amount * interest / SHARE_DIVISOR,
+            amount >= interest / SHARE_DIVISOR,
             "Amount repay must be greater than interest"
         );
-        if amount >= (borrower.amount + amount * interest / SHARE_DIVISOR) {
-            self.pool_supply += borrower.amount + amount * interest / SHARE_DIVISOR;
+        if amount >= (borrower.amount + interest / SHARE_DIVISOR) {
+            self.pool_supply += borrower.amount + interest / SHARE_DIVISOR;
             self.borrowers.remove(&borrower_id);
-            amount - (borrower.amount + amount * interest / SHARE_DIVISOR)
+            amount - (borrower.amount + interest / SHARE_DIVISOR)
         } else {
-            borrower.amount -= (amount - amount * interest / SHARE_DIVISOR);
+            borrower.amount -= (amount - interest / SHARE_DIVISOR);
             borrower.loan_start_time = env::block_timestamp();
             self.pool_supply += amount;
             self.borrowers.insert(&borrower_id, &borrower);
@@ -135,7 +133,6 @@ impl LendingPool {
     pub fn claim_reward(&mut self, lender_id: AccountId) -> Promise {
         self.update_pool();
         let lender = self.lenders.get(&lender_id).expect("Nothing to claim");
-        self.lenders.insert(&lender_id, &lender);
         ft_contract::ft_transfer(
             ValidAccountId::try_from(lender_id.clone()).unwrap(),
             U128::from(
@@ -152,7 +149,7 @@ impl LendingPool {
             lender_id,
             &env::current_account_id(),
             0,
-            5_000_000_000_000,
+            10_000_000_000_000,
         ))
     }
 
@@ -206,14 +203,22 @@ impl LendingPool {
         self.lenders.insert(&lender_id, &lender);
     }
 
-    pub fn get_list_liquidatable(&self, return_amount: Balance) -> Vec<Loan> {
+    pub fn get_list_liquidatable(&self, ref_pool: Vec<PoolInfo>) -> Vec<Loan> {
         //price: 10**24 collateral => return amount lending token
         self.borrowers
             .values()
             .filter_map(|borrower| {
-                if borrower.amount
-                    > (borrower.amount_collateral * return_amount * MAX_BORROW_RATE / 100)
-                {
+                let mut amount_near = borrower.amount_collateral;
+                if self.collateral_token != WNEAR.to_string() {
+                    amount_near = ref_pool[1].get_return(
+                        &self.collateral_token,
+                        borrower.amount_collateral,
+                        &WNEAR.to_string(),
+                    )
+                }
+                let max_amount =
+                    ref_pool[0].get_return(&WNEAR.to_string(), amount_near, &self.lending_token);
+                if borrower.amount > (max_amount * LIQUIDATE_THRESHOLD / 100) {
                     Some(borrower)
                 } else {
                     None
@@ -224,18 +229,27 @@ impl LendingPool {
 
     pub fn amount_claimable(&self, lender_id: AccountId) -> Balance {
         if let Some(lender) = self.lenders.get(&lender_id) {
-            let pendding_reward = self.borrowers.values().fold(0, |acc, borrower| {
-                acc + ((env::block_timestamp() - self.lastest_reward_time) / ONE_DAY) as Balance
-                    * borrower.amount
-                    * self.interest_rate as Balance
-                    / 365
-                    / INTEREST_DIVISOR as Balance
-            });
-            let reward_per_share =
-                self.reward_per_share + pendding_reward / (self.total_share / SHARE_DIVISOR);
+            let pendding_reward = self
+                .borrowers
+                .values()
+                .fold(0, |acc, borrower| acc + self.get_interest(&borrower));
+            let reward_per_share = self.reward_per_share
+                + (U256::from(pendding_reward) * U256::from(SHARE_DIVISOR)
+                    / U256::from(self.total_share))
+                .as_u128();
             reward_per_share * lender.share / SHARE_DIVISOR + lender.acc_reward
         } else {
             0
         }
+    }
+
+    fn get_interest(&self, borrower: &Loan) -> Balance {
+        (U256::from(self.interest_rate)
+            * U256::from(env::block_timestamp() - borrower.loan_start_time)
+            / U256::from(ONE_DAY)
+            / U256::from(365u128)
+            / U256::from(INTEREST_DIVISOR))
+        .as_u128()
+            * borrower.amount
     }
 }
