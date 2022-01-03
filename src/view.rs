@@ -1,8 +1,7 @@
 use crate::*;
 
-
 #[near_bindgen]
-impl LendingContract{
+impl LendingContract {
     pub fn metadata(&self) -> Metadata {
         self.metadata.get().unwrap()
     }

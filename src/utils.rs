@@ -3,10 +3,13 @@ pub const REF_FEE_DIVISOR: u32 = 10_000;
 pub const INTEREST_DIVISOR: u128 = 10_000;
 pub const SHARE_DIVISOR: Balance = 1_000_000_000_000;
 pub const ONE_DAY: Timestamp = 60_000_000_000;
-pub const MAX_BORROW_RATE: Balance= 50;
-pub const LIQUIDATE_THRESHOLD: Balance = 65;
-pub const ERR_NO_POOL:&str = "ERR_NO_POOL";
-pub const ERR_NO_BORROWER:&str = "ERR_NO_BORROWER";
+pub const MAX_BORROW_RATE: u128 = 50;
+pub const LIQUIDATE_THRESHOLD: u128 = 65;
+pub const LIQUIDATOR_INCENTIVE: u128 = 5;
+pub const MAX_LIQUADATE_RATE: u128 = 50;
+pub const ERR_NO_POOL: &str = "ERR_NO_POOL";
+pub const ERR_NO_BORROWER: &str = "ERR_NO_BORROWER";
+pub const ERR_REF_POOL: &str = "CAN_NOT_GET_REF_POOL_INFO";
 pub const WNEAR: &str = "wrap.testnet";
 use uint::construct_uint;
 
@@ -19,23 +22,18 @@ construct_uint! {
 }
 #[ext_contract(ft_contract)]
 trait TFT {
-    fn ft_transfer(
-        &mut self,
-        receiver_id: ValidAccountId,
-        amount: U128,
-        memo: Option<String>
-    );
+    fn ft_transfer(&mut self, receiver_id: ValidAccountId, amount: U128, memo: Option<String>);
     fn ft_transfer_call(
         &mut self,
         receiver_id: ValidAccountId,
         amount: U128,
         memo: Option<String>,
-        msg: String
+        msg: String,
     ) -> PromiseOrValue<U128>;
 }
 
 #[ext_contract(ref_contract)]
-trait TRefFinance{
+trait TRefFinance {
     #[payable]
     fn swap(&mut self, actions: Vec<SwapAction>, referral_id: Option<ValidAccountId>) -> U128;
     fn get_pool(&self, pool_id: u64) -> PoolInfo;
@@ -49,11 +47,31 @@ trait TRefFinance{
 }
 
 #[ext_contract(self_contract)]
-pub trait TSelf{
-    fn get_ref_pool_callback(&mut self, pool_id: u64, borrower_id: AccountId, amount: Balance) -> Promise;
+pub trait TSelf {
+    fn get_ref_pool_callback(
+        &mut self,
+        pool_id: u64,
+        borrower_id: AccountId,
+        amount: Balance,
+    ) -> Promise;
     fn check_claim_success(&mut self, pool_id: u64, lender: AccountId);
     fn check_withdraw_success(&mut self, pool_id: u64, lender: AccountId, amount: U128);
     fn update_borrower(&mut self, pool_id: u64, borrower: AccountId, amount: U128);
+    fn liquidate(
+        &mut self,
+        liquidator: AccountId,
+        pool_id: u64,
+        amount: Balance,
+        borrower_id: AccountId,
+    ) -> PromiseOrValue<U128>;
+    fn liquidate_callback(
+        &mut self,
+        pool_id: u64,
+        amount_deposit: Balance,
+        remain_amount: Balance,
+        amount_collateral_out: Balance,
+        borrower_id: AccountId,
+    ) -> PromiseOrValue<U128>;
 }
 
 /// Single swap action.
@@ -119,7 +137,8 @@ impl PoolInfo {
             "ERR_INVALID"
         );
         let amount_with_fee = U256::from(amount_in) * U256::from(REF_FEE_DIVISOR - self.total_fee);
-        (amount_with_fee * out_balance / (U256::from(REF_FEE_DIVISOR) * in_balance + amount_with_fee))
+        (amount_with_fee * out_balance
+            / (U256::from(REF_FEE_DIVISOR) * in_balance + amount_with_fee))
             .as_u128()
     }
 
@@ -141,17 +160,19 @@ impl PoolInfo {
 #[derive(Serialize, Deserialize)]
 #[serde(crate = "near_sdk::serde")]
 #[cfg_attr(not(target_arch = "wasm32"), derive(Debug, PartialEq))]
-pub struct TransferPayload{
-    pub transfer_type: TransferType,//"deposit", "repay", "borrow"
+pub struct TransferPayload {
+    pub transfer_type: TransferType, //"Deposit", "Repay", "Mortgate", "Liquidate"
+    pub borrower_id: Option<AccountId>, // Require once deposit to liquidate asset of borrower
     pub token: AccountId,
-    pub pool_id: u64
+    pub pool_id: u64,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(crate = "near_sdk::serde")]
 #[cfg_attr(not(target_arch = "wasm32"), derive(Debug, PartialEq))]
-pub enum TransferType{
+pub enum TransferType {
     Deposit,
     Repay,
-    Mortgate
+    Mortgate,
+    Liquidate,
 }

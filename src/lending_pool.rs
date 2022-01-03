@@ -1,6 +1,6 @@
 use crate::utils::{
-    Share, ERR_NO_BORROWER, INTEREST_DIVISOR, LIQUIDATE_THRESHOLD, MAX_BORROW_RATE, ONE_DAY,
-    SHARE_DIVISOR,
+    Share, ERR_NO_BORROWER, INTEREST_DIVISOR, LIQUIDATE_THRESHOLD, LIQUIDATOR_INCENTIVE,
+    MAX_LIQUADATE_RATE, ONE_DAY, SHARE_DIVISOR,
 };
 use crate::*;
 
@@ -122,7 +122,7 @@ impl LendingPool {
             self.borrowers.remove(&borrower_id);
             amount - (borrower.amount + interest / SHARE_DIVISOR)
         } else {
-            borrower.amount -= (amount - interest / SHARE_DIVISOR);
+            borrower.amount -= amount - interest / SHARE_DIVISOR;
             borrower.loan_start_time = env::block_timestamp();
             self.pool_supply += amount;
             self.borrowers.insert(&borrower_id, &borrower);
@@ -204,27 +204,51 @@ impl LendingPool {
     }
 
     pub fn get_list_liquidatable(&self, ref_pool: Vec<PoolInfo>) -> Vec<Loan> {
-        //price: 10**24 collateral => return amount lending token
         self.borrowers
             .values()
             .filter_map(|borrower| {
-                let mut amount_near = borrower.amount_collateral;
-                if self.collateral_token != WNEAR.to_string() {
-                    amount_near = ref_pool[1].get_return(
-                        &self.collateral_token,
-                        borrower.amount_collateral,
-                        &WNEAR.to_string(),
-                    )
-                }
-                let max_amount =
-                    ref_pool[0].get_return(&WNEAR.to_string(), amount_near, &self.lending_token);
-                if borrower.amount > (max_amount * LIQUIDATE_THRESHOLD / 100) {
+                if self.is_liquitable(&borrower, &ref_pool) {
                     Some(borrower)
                 } else {
                     None
                 }
             })
             .collect()
+    }
+
+    pub fn calculate_liquidatable(
+        &self,
+        borrower_id: AccountId,
+        amount: Balance,
+        ref_pool: Vec<PoolInfo>,
+    ) -> (Balance, Balance) {
+        let borrower = self.borrowers.get(&borrower_id).expect(ERR_NO_BORROWER);
+        if self.is_liquitable(&borrower, &ref_pool) {
+            let amount_liquidate = if amount < borrower.amount * MAX_LIQUADATE_RATE {
+                amount
+            } else {
+                borrower.amount * MAX_LIQUADATE_RATE
+            };
+            let amount_collateral_token_out = self
+                .lending_token_to_collateral_token(amount_liquidate, &ref_pool)
+                * (100 + LIQUIDATOR_INCENTIVE)
+                / 100;
+            (amount - amount_liquidate, amount_collateral_token_out)
+        } else {
+            (amount, 0)
+        }
+    }
+
+    pub fn liquidate(
+        &mut self,
+        borrower_id: AccountId,
+        amount_deposit: Balance,
+        amount_collateral_token_out: Balance,
+    ) {
+        let mut borrower = self.borrowers.get(&borrower_id).expect(ERR_NO_BORROWER);
+        borrower.amount_collateral -= amount_collateral_token_out;
+        borrower.amount -= amount_deposit;
+        self.borrowers.insert(&borrower_id, &borrower);
     }
 
     pub fn amount_claimable(&self, lender_id: AccountId) -> Balance {
@@ -251,5 +275,38 @@ impl LendingPool {
             / U256::from(INTEREST_DIVISOR))
         .as_u128()
             * borrower.amount
+    }
+
+    fn is_liquitable(&self, borrower: &Loan, ref_pool: &Vec<PoolInfo>) -> bool {
+        let amount_out =
+            self.collateral_token_to_lending_token(borrower.amount_collateral, ref_pool);
+        borrower.amount > (amount_out * LIQUIDATE_THRESHOLD / 100)
+    }
+
+    fn collateral_token_to_lending_token(
+        &self,
+        amount_in: Balance,
+        ref_pool: &Vec<PoolInfo>,
+    ) -> Balance {
+        let mut temp_amount = amount_in;
+        if self.collateral_token != WNEAR.to_string() {
+            temp_amount =
+                ref_pool[1].get_return(&self.collateral_token, amount_in, &WNEAR.to_string());
+        }
+        ref_pool[0].get_return(&WNEAR.to_string(), temp_amount, &self.lending_token)
+    }
+
+    fn lending_token_to_collateral_token(
+        &self,
+        amount_in: Balance,
+        ref_pool: &Vec<PoolInfo>,
+    ) -> Balance {
+        if self.collateral_token == WNEAR.to_string() {
+            ref_pool[0].get_return(&self.lending_token, amount_in, &WNEAR.to_string())
+        } else {
+            let amount_near_out =
+                ref_pool[0].get_return(&self.lending_token, amount_in, &WNEAR.to_string());
+            ref_pool[1].get_return(&WNEAR.to_string(), amount_near_out, &self.collateral_token)
+        }
     }
 }

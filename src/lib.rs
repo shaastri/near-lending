@@ -11,7 +11,8 @@ near_sdk::setup_alloc!();
 use lending_pool::{LenderInfo, LendingPool, Loan};
 use utils::{
     ft_contract, ref_contract, self_contract, PoolInfo, Share, TransferPayload, TransferType,
-    ERR_NO_BORROWER, ERR_NO_POOL, MAX_BORROW_RATE, REF_FEE_DIVISOR, REF_FINANCE, U256, WNEAR,
+    ERR_NO_BORROWER, ERR_NO_POOL, ERR_REF_POOL, MAX_BORROW_RATE, REF_FINANCE,
+    U256, WNEAR,
 };
 mod lending_pool;
 mod utils;
@@ -131,6 +132,82 @@ impl LendingContract {
                     0,
                     50_000_000_000_000,
                 ))
+        }
+    }
+
+    pub fn liquidate(
+        &mut self,
+        liquidator: AccountId,
+        pool_id: u64,
+        amount: Balance,
+        borrower_id: AccountId,
+    ) -> PromiseOrValue<U128> {
+        let pool = self.pools.get(pool_id).expect(ERR_NO_POOL);
+        let mut ref_pool: Vec<PoolInfo> = Vec::new();
+        if pool.collateral_token != WNEAR.to_string() {
+            match env::promise_result(env::promise_results_count() - 2) {
+                PromiseResult::Successful(collateral_token_pool) => {
+                    ref_pool.push(
+                        near_sdk::serde_json::from_slice::<PoolInfo>(&collateral_token_pool)
+                            .expect(ERR_REF_POOL),
+                    );
+                }
+                _ => {
+                    return PromiseOrValue::Value(U128::from(amount));
+                }
+            }
+        }
+        match env::promise_result(env::promise_results_count() - 1) {
+            PromiseResult::Successful(lending_token_pool) => {
+                ref_pool.push(
+                    near_sdk::serde_json::from_slice::<PoolInfo>(&lending_token_pool)
+                        .expect(ERR_REF_POOL),
+                );
+            }
+            _ => {
+                return PromiseOrValue::Value(U128::from(amount));
+            }
+        }
+        let (remain_amount, amount_collateral_out) =
+            pool.calculate_liquidatable(borrower_id.clone(), amount, ref_pool);
+        PromiseOrValue::from(
+            ft_contract::ft_transfer(
+                ValidAccountId::try_from(liquidator.clone()).unwrap(),
+                U128::from(amount_collateral_out),
+                None,
+                &pool.collateral_token,
+                1,
+                10_000_000_000_000,
+            )
+            .then(self_contract::liquidate_callback(
+                pool_id,
+                amount,
+                remain_amount,
+                amount_collateral_out,
+                borrower_id,
+                &env::current_account_id(),
+                0,
+                20_000_000_000_000,
+            )),
+        )
+    }
+
+    pub fn liquidate_callback(
+        &mut self,
+        pool_id: u64,
+        amount_deposit: Balance,
+        remain_amount: Balance,
+        amount_collateral_out: Balance,
+        borrower_id: AccountId,
+    ) -> PromiseOrValue<U128> {
+        match env::promise_result(env::promise_results_count() - 1) {
+            PromiseResult::Successful(_) => {
+                let mut pool = self.pools.get(pool_id).expect(ERR_NO_POOL);
+                pool.liquidate(borrower_id, amount_deposit, amount_collateral_out);
+                self.pools.replace(pool_id, &pool);
+                PromiseOrValue::Value(U128::from(remain_amount))
+            }
+            _ => PromiseOrValue::Value(U128::from(amount_deposit)),
         }
     }
 
@@ -319,12 +396,72 @@ impl FungibleTokenReceiver for LendingContract {
                     .expect(ERR_NO_POOL)
                     .get(&env::predecessor_account_id())
                     .expect(ERR_NO_POOL);
-                log!("{} mortgated {} token {} to pool {}", sender_id, Balance::from(amount), env::predecessor_account_id(), pool_id);
+                log!(
+                    "{} mortgated {} token {} to pool {}",
+                    sender_id,
+                    Balance::from(amount),
+                    env::predecessor_account_id(),
+                    pool_id
+                );
                 assert_eq!(pool_id, transfer_payload.pool_id, "pool id: not good");
                 let mut pool = self.pools.get(pool_id).expect(ERR_NO_POOL);
                 pool.mortgate(sender_id.into(), Balance::from(amount));
                 self.pools.replace(pool_id, &pool);
                 PromiseOrValue::Value(U128::from(0))
+            }
+            TransferType::Liquidate => {
+                let borrower = transfer_payload.borrower_id.expect(ERR_NO_BORROWER);
+                let pool_id = self
+                    .pool_ids_by_lending_token
+                    .get(&env::predecessor_account_id())
+                    .expect(ERR_NO_POOL)
+                    .get(&transfer_payload.token)
+                    .expect(ERR_NO_POOL);
+                assert_eq!(pool_id, transfer_payload.pool_id, "pool id: not good");
+                let pool = self.pools.get(pool_id).expect(ERR_NO_POOL);
+                if pool.collateral_token == WNEAR.to_string() {
+                    PromiseOrValue::from(
+                        ref_contract::get_pool(
+                            pool.ref_pool_ids[0],
+                            &REF_FINANCE,
+                            0,
+                            8_000_000_000_000,
+                        )
+                        .then(self_contract::liquidate(
+                            sender_id.into(),
+                            transfer_payload.pool_id,
+                            Balance::from(amount),
+                            borrower,
+                            &env::current_account_id(),
+                            0,
+                            50_000_000_000_000,
+                        )),
+                    )
+                } else {
+                    PromiseOrValue::from(
+                        ref_contract::get_pool(
+                            pool.ref_pool_ids[0],
+                            &REF_FINANCE,
+                            0,
+                            8_000_000_000_000,
+                        )
+                        .then(ref_contract::get_pool(
+                            pool.ref_pool_ids[1],
+                            &REF_FINANCE,
+                            0,
+                            8_000_000_000_000,
+                        ))
+                        .then(self_contract::liquidate(
+                            sender_id.into(),
+                            transfer_payload.pool_id,
+                            Balance::from(amount),
+                            borrower,
+                            &env::current_account_id(),
+                            0,
+                            50_000_000_000_000,
+                        )),
+                    )
+                }
             }
         }
     }
