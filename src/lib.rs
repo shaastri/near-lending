@@ -419,7 +419,7 @@ impl FungibleTokenReceiver for LendingContract {
                 PromiseOrValue::Value(U128::from(refund))
             }
             // Deposit collateral token to pool to borrow lending token
-            TransferType::Mortgate => {
+            TransferType::Mortgage => {
                 let pool_id = self
                     .pool_ids_by_lending_token
                     .get(&transfer_payload.token) // Lending token
@@ -427,7 +427,7 @@ impl FungibleTokenReceiver for LendingContract {
                     .get(&env::predecessor_account_id()) // Collateral token
                     .expect(ERR_NO_POOL);
                 log!(
-                    "{} mortgated {} token {} to pool {}",
+                    "{} mortgaged {} token {} to pool {}",
                     sender_id,
                     Balance::from(amount),
                     env::predecessor_account_id(),
@@ -435,7 +435,7 @@ impl FungibleTokenReceiver for LendingContract {
                 );
                 assert_eq!(pool_id, transfer_payload.pool_id, "pool id: not good");
                 let mut pool = self.pools.get(pool_id).expect(ERR_NO_POOL);
-                pool.mortgate(sender_id.into(), Balance::from(amount));
+                pool.mortgage(sender_id.into(), Balance::from(amount));
                 self.pools.replace(pool_id, &pool);
                 PromiseOrValue::Value(U128::from(0))
             }

@@ -74,7 +74,7 @@ impl LendingPool {
         self.total_share += amount;
     }
 
-    pub fn mortgate(&mut self, borrower_id: AccountId, amount_collateral: Balance) -> Loan {
+    pub fn mortgage(&mut self, borrower_id: AccountId, amount_collateral: Balance) -> Loan {
         let mut borrower = self.borrowers.get(&borrower_id).unwrap_or(Loan {
             borrower: borrower_id.clone(),
             loan_start_time: env::block_timestamp(),

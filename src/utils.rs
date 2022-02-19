@@ -161,7 +161,7 @@ impl PoolInfo {
 #[serde(crate = "near_sdk::serde")]
 #[cfg_attr(not(target_arch = "wasm32"), derive(Debug, PartialEq))]
 pub struct TransferPayload {
-    pub transfer_type: TransferType, //"Deposit", "Repay", "Mortgate", "Liquidate"
+    pub transfer_type: TransferType, //"Deposit", "Repay", "Mortgage", "Liquidate"
     pub borrower_id: Option<AccountId>, // Require once deposit to liquidate asset of borrower
     pub token: AccountId,
     pub pool_id: u64,
@@ -173,6 +173,6 @@ pub struct TransferPayload {
 pub enum TransferType {
     Deposit,
     Repay,
-    Mortgate,
+    Mortgage,
     Liquidate,
 }
