@@ -9,8 +9,6 @@ use crate::*;
 pub struct LendingPool {
     pub pool_id: u64,
     pub lending_token: AccountId,
-    pub collateral_token: AccountId,
-    pub ref_pool_ids: Vec<u64>, //[lending token pool id, collateral token pool id] - pool wnear - token
     pub interest_rate: u64,
     pub pool_supply: Balance,
     pub amount_borrowed: Balance,
@@ -25,19 +23,20 @@ pub struct LendingPool {
 #[serde(crate = "near_sdk::serde")]
 #[derive(BorshDeserialize, BorshSerialize)]
 pub struct Loan {
+    pub lending_token: AccountId,
     pub borrower: AccountId,
     pub loan_start_time: Timestamp,
     pub amount: Balance,
-    pub amount_collateral: Balance,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(crate = "near_sdk::serde")]
 #[derive(BorshDeserialize, BorshSerialize)]
 pub struct LenderInfo {
-    share: Share,
-    reward_debt: Balance,
-    acc_reward: Balance,
+    pub lending_token: AccountId,
+    pub share: Share,
+    pub reward_debt: Balance,
+    pub acc_reward: Balance,
 }
 
 impl LendingPool {
@@ -58,7 +57,9 @@ impl LendingPool {
 
     pub fn deposit(&mut self, lender_id: AccountId, amount: Balance) {
         self.update_pool();
+        let lending_token = self.lending_token.clone();
         let mut lender = self.lenders.get(&lender_id).unwrap_or(LenderInfo {
+            lending_token,
             share: 0,
             reward_debt: 0,
             acc_reward: 0,
@@ -72,25 +73,6 @@ impl LendingPool {
         self.lenders.insert(&lender_id, &lender);
         self.pool_supply += amount;
         self.total_share += amount;
-    }
-
-    pub fn mortgate(&mut self, borrower_id: AccountId, amount_collateral: Balance) -> Loan {
-        let mut borrower = self.borrowers.get(&borrower_id).unwrap_or(Loan {
-            borrower: borrower_id.clone(),
-            loan_start_time: env::block_timestamp(),
-            amount: 0u128,
-            amount_collateral: 0u128,
-        });
-        borrower.amount_collateral += amount_collateral;
-        self.borrowers.insert(&borrower_id, &borrower);
-        borrower
-    }
-
-    pub fn withdraw_collateral(&mut self, borrower_id: AccountId, amount: Balance) -> Loan {
-        let mut borrower = self.borrowers.get(&borrower_id).expect(ERR_NO_BORROWER);
-        borrower.amount_collateral -= amount;
-        self.borrowers.insert(&borrower_id, &borrower);
-        borrower
     }
 
     pub fn borrow(&mut self, borrower_id: AccountId, amount: Balance) {
@@ -203,55 +185,15 @@ impl LendingPool {
         self.lenders.insert(&lender_id, &lender);
     }
 
-    pub fn get_list_liquidatable(&self, ref_pool: Vec<PoolInfo>) -> Vec<Loan> {
-        self.borrowers
-            .values()
-            .filter_map(|borrower| {
-                if self.is_liquitable(&borrower, &ref_pool) {
-                    Some(borrower)
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    pub fn calculate_liquidatable(
-        &self,
-        borrower_id: AccountId,
-        amount: Balance,
-        ref_pool: Vec<PoolInfo>,
-    ) -> (Balance, Balance) {
-        let borrower = self.borrowers.get(&borrower_id).expect(ERR_NO_BORROWER);
-        if self.is_liquitable(&borrower, &ref_pool) {
-            let amount_liquidate = if amount < borrower.amount * MAX_LIQUADATE_RATE {
-                amount
-            } else {
-                borrower.amount * MAX_LIQUADATE_RATE
-            };
-            let amount_collateral_token_out = self
-                .lending_token_to_collateral_token(amount_liquidate, &ref_pool)
-                * (100 + LIQUIDATOR_INCENTIVE)
-                / 100;
-            (amount - amount_liquidate, amount_collateral_token_out)
-        } else {
-            (amount, 0)
-        }
-    }
-
     pub fn liquidate(
         &mut self,
         borrower_id: AccountId,
         amount_deposit: Balance,
         amount_collateral_token_out: Balance,
     ) {
-        let mut borrower = self.borrowers.get(&borrower_id).expect(ERR_NO_BORROWER);
-        borrower.amount_collateral -= amount_collateral_token_out;
-        borrower.amount -= amount_deposit;
-        self.borrowers.insert(&borrower_id, &borrower);
     }
 
-    pub fn amount_claimable(&self, lender_id: AccountId) -> Balance {
+    pub fn amount_claimable(&self, lender_id: &AccountId) -> Balance {
         if let Some(lender) = self.lenders.get(&lender_id) {
             let pendding_reward = self
                 .borrowers
@@ -267,7 +209,7 @@ impl LendingPool {
         }
     }
 
-    fn get_interest(&self, borrower: &Loan) -> Balance {
+    pub fn get_interest(&self, borrower: &Loan) -> Balance {
         (U256::from(self.interest_rate)
             * U256::from(env::block_timestamp() - borrower.loan_start_time)
             / U256::from(ONE_DAY)
@@ -275,38 +217,5 @@ impl LendingPool {
             / U256::from(INTEREST_DIVISOR))
         .as_u128()
             * borrower.amount
-    }
-
-    fn is_liquitable(&self, borrower: &Loan, ref_pool: &Vec<PoolInfo>) -> bool {
-        let amount_out =
-            self.collateral_token_to_lending_token(borrower.amount_collateral, ref_pool);
-        borrower.amount > (amount_out * LIQUIDATE_THRESHOLD / 100)
-    }
-
-    fn collateral_token_to_lending_token(
-        &self,
-        amount_in: Balance,
-        ref_pool: &Vec<PoolInfo>,
-    ) -> Balance {
-        let mut temp_amount = amount_in;
-        if self.collateral_token != WNEAR.to_string() {
-            temp_amount =
-                ref_pool[1].get_return(&self.collateral_token, amount_in, &WNEAR.to_string());
-        }
-        ref_pool[0].get_return(&WNEAR.to_string(), temp_amount, &self.lending_token)
-    }
-
-    fn lending_token_to_collateral_token(
-        &self,
-        amount_in: Balance,
-        ref_pool: &Vec<PoolInfo>,
-    ) -> Balance {
-        if self.collateral_token == WNEAR.to_string() {
-            ref_pool[0].get_return(&self.lending_token, amount_in, &WNEAR.to_string())
-        } else {
-            let amount_near_out =
-                ref_pool[0].get_return(&self.lending_token, amount_in, &WNEAR.to_string());
-            ref_pool[1].get_return(&WNEAR.to_string(), amount_near_out, &self.collateral_token)
-        }
     }
 }
