@@ -2,7 +2,7 @@ pub const ORACLE: &str = "oracle.tieubaoca.testnet";
 pub const INTEREST_DIVISOR: u128 = 10_000;
 pub const PRICE_DIVISOR: f64 = 10_000f64;
 pub const SHARE_DIVISOR: Balance = 1_000_000_000_000;
-pub const ONE_DAY: Timestamp = 60_000_000_000;
+pub const ONE_DAY: Timestamp = 86_400_000_000_000;
 pub const ORACLE_DATA_EXPIRATION: Timestamp = 600_000_000_000;
 pub const MAX_BORROW_RATE: u128 = 50;
 pub const BORROW_RATE_DIVISOR: Balance = 100;
@@ -44,7 +44,13 @@ trait TOracle {
 #[ext_contract(self_contract)]
 pub trait TSelf {
     fn check_claim_success(&mut self, pool_id: u64, lender: AccountId);
-    fn check_withdraw_success(&mut self, pool_id: u64, lender: AccountId, amount: U128);
+    fn check_withdraw_success(
+        &mut self,
+        pool_id: u64,
+        lender: AccountId,
+        amount: U128,
+        interest: U128,
+    );
     fn update_borrower(&mut self, pool_id: u64, borrower: AccountId, amount: U128);
     fn check_borrowable(
         &mut self,
