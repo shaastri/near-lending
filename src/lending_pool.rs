@@ -376,5 +376,16 @@ mod tests {
             lending_pool.pool_supply,
             deposit_amount * 2 - 3 * interest - deposit_amount / 2 - lending_pool.amount_borrowed
         );
+
+        //day 40
+        // day 30 -> 40, lender 2/3, lender 2 1/3
+        // borrowed amount = 2 * borrow_amount -> interest * 2
+        let context = get_context(String::from("bob.near"), ONE_DAY * 40, 0);
+        testing_env!(context.clone());
+
+        assert_eq!(
+            lending_pool.amount_claimable(&String::from("lender2.near")),
+            2 * interest / 3
+        );
     }
 }
