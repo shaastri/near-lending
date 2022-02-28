@@ -223,7 +223,11 @@ impl LendingContract {
         let decimals = self.token_decimals.get(&pool.lending_token).unwrap() as u32;
         loan_value += u128::from(amount) * price / PRICE_DIVISOR as u128 / 10u128.pow(decimals);
 
-        assert!(loan_value <= deposit_value, "{}", ERR_BORROW_VALUE_LIMITED);
+        assert!(
+            loan_value <= MAX_BORROW_RATE * deposit_value / BORROW_RATE_DIVISOR,
+            "{}",
+            ERR_BORROW_VALUE_LIMITED
+        );
 
         ft_contract::ft_transfer(
             ValidAccountId::try_from(borrower_id.clone()).unwrap(),
@@ -329,7 +333,7 @@ impl LendingContract {
             env::predecessor_account_id(),
             self.get_amount_claimable(pool_id, env::predecessor_account_id())
         );
-        let mut pool = self.pools.get(pool_id).expect(ERR_NO_POOL);
+        let pool = self.pools.get(pool_id).expect(ERR_NO_POOL);
         let amount_claimable = pool.amount_claimable(&env::predecessor_account_id());
         ft_contract::ft_transfer(
             ValidAccountId::try_from(env::predecessor_account_id()).unwrap(),
@@ -358,7 +362,7 @@ impl LendingContract {
             Balance::from(amount),
             self.get_amount_claimable(pool_id, env::predecessor_account_id())
         );
-        let mut pool = self.pools.get(pool_id).expect(ERR_NO_POOL);
+        let pool = self.pools.get(pool_id).expect(ERR_NO_POOL);
         let interest = pool.amount_claimable(&env::predecessor_account_id());
         ft_contract::ft_transfer(
             ValidAccountId::try_from(env::predecessor_account_id()).unwrap(),
