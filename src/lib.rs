@@ -5,7 +5,7 @@ use near_sdk::json_types::{ValidAccountId, U128};
 use near_sdk::serde::{Deserialize, Serialize};
 use near_sdk::{
     assert_one_yocto, env, ext_contract, log, near_bindgen, serde_json, AccountId, Balance, Gas,
-    PanicOnDefault, Promise, PromiseOrValue, PromiseResult, Timestamp,
+    PanicOnDefault, Promise, PromiseIndex, PromiseOrValue, PromiseResult, Timestamp,
 };
 near_sdk::setup_alloc!();
 use lending_pool::{LenderInfo, LendingPool, Loan};
@@ -95,7 +95,7 @@ impl LendingContract {
 
     // After deposit collateral token, borrower can borrow lending token from pool
     #[payable]
-    pub fn borrow(&mut self, pool_id: u64, amount: U128) -> Promise {
+    pub fn borrow(&mut self, pool_id: u64, amount: U128) {
         let pool = &self.pools.get(pool_id).expect(ERR_NO_POOL);
         assert!(
             Balance::from(amount) <= pool.pool_supply,
@@ -104,45 +104,153 @@ impl LendingContract {
         assert_one_yocto();
         let all_loans = self.get_all_loans(&env::predecessor_account_id());
         let all_deposits = self.get_all_deposits(&env::predecessor_account_id());
-        let mut promises: Promise = oracle_contract::get_data_response(
-            all_loans[0].lending_token.clone(),
-            &ORACLE,
-            0,
-            5_000_000_000_000,
+
+        let mut promise_id = env::promise_batch_create(
+            ORACLE.to_string(), // the recipient of this ActionReceipt (contract account id)
         );
-        for i in 1..all_loans.len() {
-            promises = promises.then(oracle_contract::get_data_response(
-                all_loans[i].lending_token.clone(),
-                &ORACLE,
-                0,
-                5_000_000_000_000,
-            ));
+        for i in 0..all_loans.len() {
+            // attach a function call action to the ActionReceipt
+            env::promise_batch_action_function_call(
+                promise_id,           // associate the function call with the above Receipt via promise_id
+                b"get_data_response", // the function call will invoke the ft_balance_of method on the wrap.testnet
+                &serde_json::json!({ "request_id": all_loans[i].lending_token.to_string() }) // method arguments
+                    .to_string()
+                    .into_bytes(),
+                0,                 // amount of yoctoNEAR to attach
+                5_000_000_000_000, // gas to attach
+            );
+
+            promise_id = env::promise_batch_then(
+                promise_id,         // postpone until a DataReceipt associated with promise_id is received
+                ORACLE.to_string(), // the recipient of this ActionReceipt (&self)
+            );
         }
         for i in 0..all_deposits.len() {
-            promises = promises.then(oracle_contract::get_data_response(
-                all_deposits[i].lending_token.clone(),
-                &ORACLE,
-                0,
-                5_000_000_000_000,
-            ));
+            // attach a function call action to the ActionReceipt
+            env::promise_batch_action_function_call(
+                promise_id,           // associate the function call with the above Receipt via promise_id
+                b"get_data_response", // the function call will invoke the ft_balance_of method on the wrap.testnet
+                &serde_json::json!({ "request_id": all_deposits[i].lending_token.to_string() }) // method arguments
+                    .to_string()
+                    .into_bytes(),
+                0,                 // amount of yoctoNEAR to attach
+                5_000_000_000_000, // gas to attach
+            );
+
+            promise_id = env::promise_batch_then(
+                promise_id,         // postpone until a DataReceipt associated with promise_id is received
+                ORACLE.to_string(), // the recipient of this ActionReceipt (&self)
+            );
         }
-        promises
-            .then(oracle_contract::get_data_response(
-                pool.lending_token.clone(),
-                &ORACLE,
-                0,
-                5_000_000_000_000,
-            ))
-            .then(self_contract::check_borrowable(
-                env::predecessor_account_id(),
-                pool_id,
-                amount,
-                all_loans,
-                all_deposits,
-                &env::current_account_id(),
-                0,
-                30_000_000_000_000,
-            ))
+
+        env::promise_batch_action_function_call(
+            promise_id,           // associate the function call with the above Receipt via promise_id
+            b"get_data_response", // the function call will invoke the ft_balance_of method on the wrap.testnet
+            &serde_json::json!({ "request_id": pool.lending_token.to_string() }) // method arguments
+                .to_string()
+                .into_bytes(),
+            0,                 // amount of yoctoNEAR to attach
+            5_000_000_000_000, // gas to attach
+        );
+
+        // Create another promise, which will create another (empty) ActionReceipt.
+        // This time, the ActionReceipt is dependent on the previous receipt
+        let callback_promise_id = env::promise_batch_then(
+            promise_id, // postpone until a DataReceipt associated with promise_id is received
+            env::current_account_id(), // the recipient of this ActionReceipt (&self)
+        );
+
+        // attach a function call action to the ActionReceipt
+        env::promise_batch_action_function_call(
+            callback_promise_id, // associate the function call with callback_promise_id
+            b"check_borrowable", // the function call will be a callback function
+            &serde_json::json!({ "borrower_id" : env::predecessor_account_id(),
+                "pool_id": pool_id,
+                "amount": amount,
+                "loans": serde_json::json!(all_loans),
+                "deposits": serde_json::json!(all_deposits), }) // method arguments
+            .to_string()
+            .into_bytes(), // method arguments
+            0,                   // amount of yoctoNEAR to attach
+            5_000_000_000_000,   // gas to attach
+        );
+
+        // return the resulting DataReceipt from callback_promise_id as the result of this function
+        env::promise_return(callback_promise_id);
+        // if all_loans.len() > 0 {
+        // let mut promises: Promise = oracle_contract::get_data_response(
+        //     all_loans[0].lending_token.clone(),
+        //     &ORACLE,
+        //     0,
+        //     5_000_000_000_000,
+        // );
+        // for i in 1..all_loans.len() {
+        //     promises = promises.then(oracle_contract::get_data_response(
+        //         all_loans[i].lending_token.clone(),
+        //         &ORACLE,
+        //         0,
+        //         5_000_000_000_000,
+        //     ));
+        // }
+        // for i in 0..all_deposits.len() {
+        //     promises = promises.then(oracle_contract::get_data_response(
+        //         all_deposits[i].lending_token.clone(),
+        //         &ORACLE,
+        //         0,
+        //         5_000_000_000_000,
+        //     ));
+        // }
+        // promises
+        //     .then(oracle_contract::get_data_response(
+        //         pool.lending_token.clone(),
+        //         &ORACLE,
+        //         0,
+        //         5_000_000_000_000,
+        //     ))
+        //     .then(self_contract::check_borrowable(
+        //         env::predecessor_account_id(),
+        //         pool_id,
+        //         amount,
+        //         all_loans,
+        //         all_deposits,
+        //         &env::current_account_id(),
+        //         0,
+        //         100_000_000_000_000,
+        //     ))
+
+        // } else {
+        //     let mut promises: Promise = oracle_contract::get_data_response(
+        //         all_deposits[0].lending_token.clone(),
+        //         &ORACLE,
+        //         0,
+        //         5_000_000_000_000,
+        //     );
+        //     for i in 1..all_deposits.len() {
+        //         promises = promises.then(oracle_contract::get_data_response(
+        //             all_deposits[i].lending_token.clone(),
+        //             &ORACLE,
+        //             0,
+        //             5_000_000_000_000,
+        //         ));
+        //     }
+        //     promises
+        //         .then(oracle_contract::get_data_response(
+        //             pool.lending_token.clone(),
+        //             &ORACLE,
+        //             0,
+        //             5_000_000_000_000,
+        //         ))
+        //         .then(self_contract::check_borrowable(
+        //             env::predecessor_account_id(),
+        //             pool_id,
+        //             amount,
+        //             all_loans,
+        //             all_deposits,
+        //             &env::current_account_id(),
+        //             0,
+        //             100_000_000_000_000,
+        //         ))
+        // }
     }
 
     #[private]
@@ -151,33 +259,64 @@ impl LendingContract {
         borrower_id: AccountId,
         pool_id: u64,
         amount: U128,
-        loans: Vec<Loan>,
-        deposits: Vec<LenderInfo>,
+        loans: Vec<LoanCallArgument>,
+        deposits: Vec<DepositCallArgument>,
     ) -> Promise {
         let loans_len = loans.len() as u64;
         let deposits_len = deposits.len() as u64;
         let mut loan_value: u128 = 0;
         let mut deposit_value: u128 = 0;
         for i in 0..loans_len {
+            log!(
+                "{}",
+                format!("Received {} promise", env::promise_results_count())
+            );
             let price = LendingContract::process_data_response_get_price(env::promise_result(
                 env::promise_results_count() - loans_len - deposits_len - 1 + i,
             ));
-            loan_value += loans[i as usize].amount * price / PRICE_DIVISOR as u128;
+            log!(
+                "{}",
+                format!(
+                    "loan: {} price: {} USD",
+                    loans[i as usize].lending_token,
+                    price as f64 / PRICE_DIVISOR
+                )
+            );
+            loan_value += Balance::from(loans[i as usize].amount) * price / PRICE_DIVISOR as u128;
         }
 
         for i in 0..deposits_len {
             let price = LendingContract::process_data_response_get_price(env::promise_result(
-                env::promise_results_count() - deposits_len - 1 + i,
+                env::promise_results_count() + i - deposits_len - 1,
             ));
-            deposit_value += deposits[i as usize].share * price / PRICE_DIVISOR as u128;
+            log!(
+                "{}",
+                format!(
+                    "deposit: {} price: {} USD",
+                    deposits[i as usize].lending_token,
+                    price as f64 / PRICE_DIVISOR
+                )
+            );
+            deposit_value +=
+                Balance::from(deposits[i as usize].share) * price / PRICE_DIVISOR as u128;
         }
 
         let price = LendingContract::process_data_response_get_price(env::promise_result(
             env::promise_results_count() - 1,
         ));
+
         loan_value += u128::from(amount) * price / PRICE_DIVISOR as u128;
 
         let pool = &self.pools.get(pool_id).expect(ERR_NO_POOL);
+
+        log!(
+            "{}",
+            format!(
+                "borrow: {} price: {} USD",
+                pool.lending_token,
+                price as f64 / PRICE_DIVISOR
+            )
+        );
 
         assert!(
             loan_value
@@ -223,13 +362,15 @@ impl LendingContract {
         }
     }
 
-    fn get_all_deposits(&self, user: &AccountId) -> Vec<LenderInfo> {
+    fn get_all_deposits(&self, user: &AccountId) -> Vec<DepositCallArgument> {
         self.pools
             .iter()
             .filter_map(|pool| {
-                if let Some(mut deposit) = pool.lenders.get(user) {
-                    deposit.share += pool.amount_claimable(user);
-                    Some(deposit)
+                if let Some(deposit) = pool.lenders.get(user) {
+                    Some(DepositCallArgument {
+                        lending_token: deposit.lending_token,
+                        share: U128::from(deposit.share + pool.amount_claimable(user)),
+                    })
                 } else {
                     None
                 }
@@ -237,13 +378,15 @@ impl LendingContract {
             .collect()
     }
 
-    fn get_all_loans(&self, borrower_id: &AccountId) -> Vec<Loan> {
+    fn get_all_loans(&self, borrower_id: &AccountId) -> Vec<LoanCallArgument> {
         self.pools
             .iter()
             .filter_map(|pool| {
-                if let Some(mut loan) = pool.borrowers.get(borrower_id) {
-                    loan.amount += pool.get_interest(&loan);
-                    Some(loan)
+                if let Some(loan) = pool.borrowers.get(borrower_id) {
+                    Some(LoanCallArgument {
+                        lending_token: loan.lending_token.clone(),
+                        amount: U128::from(loan.amount + pool.get_interest(&loan)),
+                    })
                 } else {
                     None
                 }
@@ -280,7 +423,6 @@ impl LendingContract {
         borrower_id: AccountId,
     ) {
         let pool = self.pools.get(pool_id).expect(ERR_NO_POOL);
-        // get Ref finance pool to calculate amount collateral token out
     }
 
     // Claim reward of lender
@@ -292,7 +434,7 @@ impl LendingContract {
             env::predecessor_account_id(),
             self.get_amount_claimable(pool_id, env::predecessor_account_id())
         );
-        let mut pool = self.pools.get(pool_id).expect(ERR_NO_POOL);
+        let pool = self.pools.get(pool_id).expect(ERR_NO_POOL);
         let amount_claimable = pool.amount_claimable(&env::predecessor_account_id());
         ft_contract::ft_transfer(
             ValidAccountId::try_from(env::predecessor_account_id()).unwrap(),
@@ -321,7 +463,7 @@ impl LendingContract {
             Balance::from(amount),
             self.get_amount_claimable(pool_id, env::predecessor_account_id())
         );
-        let mut pool = self.pools.get(pool_id).expect(ERR_NO_POOL);
+        let pool = self.pools.get(pool_id).expect(ERR_NO_POOL);
         let interest = pool.amount_claimable(&env::predecessor_account_id());
         ft_contract::ft_transfer(
             ValidAccountId::try_from(env::predecessor_account_id()).unwrap(),
@@ -465,6 +607,22 @@ pub struct PoolMetadata {
     pub amount_borrowed: Balance,
     pub total_share: Share,
     pub reward_per_share: Balance,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(crate = "near_sdk::serde")]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct LoanCallArgument {
+    pub lending_token: AccountId,
+    pub amount: U128,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(crate = "near_sdk::serde")]
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct DepositCallArgument {
+    pub lending_token: AccountId,
+    pub share: U128,
 }
 
 // #[cfg(all(test, not(target_arch = "wasm32")))]
