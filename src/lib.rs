@@ -104,45 +104,79 @@ impl LendingContract {
         assert_one_yocto();
         let all_loans = self.get_all_loans(&env::predecessor_account_id());
         let all_deposits = self.get_all_deposits(&env::predecessor_account_id());
-        let mut promises: Promise = oracle_contract::get_data_response(
-            all_loans[0].lending_token.clone(),
-            &ORACLE,
-            0,
-            5_000_000_000_000,
-        );
-        for i in 1..all_loans.len() {
-            promises = promises.then(oracle_contract::get_data_response(
-                all_loans[i].lending_token.clone(),
+        if all_loans.len() > 0 {
+            let mut promises: Promise = oracle_contract::get_data_response(
+                all_loans[0].lending_token.clone(),
                 &ORACLE,
                 0,
                 5_000_000_000_000,
-            ));
+            );
+            for i in 1..all_loans.len() {
+                promises = promises.and(oracle_contract::get_data_response(
+                    all_loans[i].lending_token.clone(),
+                    &ORACLE,
+                    0,
+                    5_000_000_000_000,
+                ));
+            }
+            for i in 0..all_deposits.len() {
+                promises = promises.and(oracle_contract::get_data_response(
+                    all_deposits[i].lending_token.clone(),
+                    &ORACLE,
+                    0,
+                    5_000_000_000_000,
+                ));
+            }
+            promises
+                .and(oracle_contract::get_data_response(
+                    pool.lending_token.clone(),
+                    &ORACLE,
+                    0,
+                    5_000_000_000_000,
+                ))
+                .then(self_contract::check_borrowable(
+                    env::predecessor_account_id(),
+                    pool_id,
+                    amount,
+                    all_loans,
+                    all_deposits,
+                    &env::current_account_id(),
+                    0,
+                    100_000_000_000_000,
+                ))
+        } else {
+            let mut promises: Promise = oracle_contract::get_data_response(
+                all_deposits[0].lending_token.clone(),
+                &ORACLE,
+                0,
+                5_000_000_000_000,
+            );
+            for i in 1..all_deposits.len() {
+                promises = promises.and(oracle_contract::get_data_response(
+                    all_deposits[i].lending_token.clone(),
+                    &ORACLE,
+                    0,
+                    5_000_000_000_000,
+                ));
+            }
+            promises
+                .and(oracle_contract::get_data_response(
+                    pool.lending_token.clone(),
+                    &ORACLE,
+                    0,
+                    5_000_000_000_000,
+                ))
+                .then(self_contract::check_borrowable(
+                    env::predecessor_account_id(),
+                    pool_id,
+                    amount,
+                    all_loans,
+                    all_deposits,
+                    &env::current_account_id(),
+                    0,
+                    100_000_000_000_000,
+                ))
         }
-        for i in 0..all_deposits.len() {
-            promises = promises.then(oracle_contract::get_data_response(
-                all_deposits[i].lending_token.clone(),
-                &ORACLE,
-                0,
-                5_000_000_000_000,
-            ));
-        }
-        promises
-            .then(oracle_contract::get_data_response(
-                pool.lending_token.clone(),
-                &ORACLE,
-                0,
-                5_000_000_000_000,
-            ))
-            .then(self_contract::check_borrowable(
-                env::predecessor_account_id(),
-                pool_id,
-                amount,
-                all_loans,
-                all_deposits,
-                &env::current_account_id(),
-                0,
-                30_000_000_000_000,
-            ))
     }
 
     #[private]
@@ -162,31 +196,34 @@ impl LendingContract {
             let price = LendingContract::process_data_response_get_price(env::promise_result(
                 env::promise_results_count() - loans_len - deposits_len - 1 + i,
             ));
-            loan_value += loans[i as usize].amount * price / PRICE_DIVISOR as u128;
+            let decimals = self
+                .token_decimals
+                .get(&loans[i as usize].lending_token)
+                .unwrap() as u32;
+            loan_value +=
+                loans[i as usize].amount * price / PRICE_DIVISOR as u128 / 10u128.pow(decimals);
         }
 
         for i in 0..deposits_len {
             let price = LendingContract::process_data_response_get_price(env::promise_result(
                 env::promise_results_count() - deposits_len - 1 + i,
             ));
-            deposit_value += deposits[i as usize].share * price / PRICE_DIVISOR as u128;
+            let decimals = self
+                .token_decimals
+                .get(&deposits[i as usize].lending_token)
+                .unwrap() as u32;
+            deposit_value +=
+                deposits[i as usize].share * price / PRICE_DIVISOR as u128 / 10u128.pow(decimals);
         }
+        let pool = &self.pools.get(pool_id).expect(ERR_NO_POOL);
 
         let price = LendingContract::process_data_response_get_price(env::promise_result(
             env::promise_results_count() - 1,
         ));
-        loan_value += u128::from(amount) * price / PRICE_DIVISOR as u128;
+        let decimals = self.token_decimals.get(&pool.lending_token).unwrap() as u32;
+        loan_value += u128::from(amount) * price / PRICE_DIVISOR as u128 / 10u128.pow(decimals);
 
-        let pool = &self.pools.get(pool_id).expect(ERR_NO_POOL);
-
-        assert!(
-            loan_value
-                <= deposit_value * MAX_BORROW_RATE
-                    / BORROW_RATE_DIVISOR
-                    / 10u128.pow(self.token_decimals.get(&pool.lending_token).unwrap() as u32),
-            "{}",
-            ERR_BORROW_VALUE_LIMITED
-        );
+        assert!(loan_value <= deposit_value, "{}", ERR_BORROW_VALUE_LIMITED);
 
         ft_contract::ft_transfer(
             ValidAccountId::try_from(borrower_id.clone()).unwrap(),
