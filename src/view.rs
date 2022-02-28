@@ -10,7 +10,7 @@ impl LendingContract {
         self.pools
             .get(pool_id)
             .expect(ERR_NO_POOL)
-            .amount_claimable(lender_id)
+            .amount_claimable(&lender_id)
     }
 
     pub fn get_pools(&self, from_index: usize, limit: usize) -> Vec<PoolMetadata> {
@@ -21,7 +21,6 @@ impl LendingContract {
             .map(|pool| PoolMetadata {
                 pool_id: pool.pool_id,
                 lending_token: pool.lending_token,
-                collateral_token: pool.collateral_token,
                 interest_rate: pool.interest_rate,
                 pool_supply: pool.pool_supply,
                 amount_borrowed: pool.amount_borrowed,
@@ -36,7 +35,6 @@ impl LendingContract {
         PoolMetadata {
             pool_id: pool.pool_id,
             lending_token: pool.lending_token,
-            collateral_token: pool.collateral_token,
             interest_rate: pool.interest_rate,
             pool_supply: pool.pool_supply,
             amount_borrowed: pool.amount_borrowed,

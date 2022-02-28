@@ -10,8 +10,10 @@ use near_sdk::{
 near_sdk::setup_alloc!();
 use lending_pool::{LenderInfo, LendingPool, Loan};
 use utils::{
-    ft_contract, ref_contract, self_contract, PoolInfo, Share, TransferPayload, TransferType,
-    ERR_NO_BORROWER, ERR_NO_POOL, ERR_REF_POOL, MAX_BORROW_RATE, REF_FINANCE, U256, WNEAR,
+    ft_contract, oracle_contract, self_contract, Response, Share, TransferPayload, TransferType,
+    BORROW_RATE_DIVISOR, ERR_BORROW_VALUE_LIMITED, ERR_NO_BORROWER, ERR_NO_POOL,
+    ERR_ORACLE_DATA_EXPIRED, MAX_BORROW_RATE, ORACLE, ORACLE_DATA_EXPIRATION, PRICE_DIVISOR,
+    PROMISE_NOT_SUCCESSFUL, U256, WRONG_FORMAT_PROMISE_RESULT,
 };
 mod lending_pool;
 mod utils;
@@ -22,9 +24,10 @@ mod view;
 pub struct LendingContract {
     pub owner: AccountId,
     pub metadata: LazyOption<Metadata>,
-    pub pool_ids_by_lending_token: UnorderedMap<AccountId, UnorderedMap<AccountId, u64>>,
+    pub pool_ids_by_lending_token: UnorderedMap<AccountId, u64>,
     pub pools: Vector<LendingPool>,
     pub pool_count: u64,
+    pub token_decimals: UnorderedMap<AccountId, u8>,
 }
 
 #[near_bindgen]
@@ -37,7 +40,7 @@ impl LendingContract {
             metadata: LazyOption::new(
                 b"metadata".to_vec(),
                 Some(&Metadata {
-                    title: Some("Bao Tran Lending Contract".to_string()),
+                    title: Some("Lending Contract".to_string()),
                     organization: None,
                     description: Some(
                         "Lending, borrowing decentralize on Near protocol".to_string(),
@@ -47,6 +50,7 @@ impl LendingContract {
             pool_ids_by_lending_token: UnorderedMap::new(b"pool_id_by_lending_token".to_vec()),
             pools: Vector::new(b"pools".to_vec()),
             pool_count: 0,
+            token_decimals: UnorderedMap::new(b"token_decimals".to_vec()),
         }
     }
 
@@ -54,9 +58,8 @@ impl LendingContract {
     pub fn create_new_lending_pool(
         &mut self,
         lending_token: ValidAccountId,
-        collateral_token: ValidAccountId,
-        ref_pool_ids: Vec<u64>, // pool id with wnear on Ref finance,[collater - wnear, lending - wnear]
-        interest_rate: u64,     // interest rate /10000
+        decimals: u8,
+        interest_rate: u64, // interest rate /10000
     ) {
         assert_eq!(
             env::predecessor_account_id(),
@@ -70,18 +73,9 @@ impl LendingContract {
                 lending_token, self.pool_count
             )
         );
-        // Create a mapping to easily get pool id
-        let mut pool_id_by_collateral_token = self
-            .pool_ids_by_lending_token
-            .get(&lending_token.clone().into())
-            .unwrap_or(UnorderedMap::new(
-                format!("lending_token{}", lending_token.to_string()).as_bytes(),
-            ));
         let pool = LendingPool {
             pool_id: self.pool_count,
             lending_token: lending_token.clone().into(),
-            collateral_token: collateral_token.clone().into(),
-            ref_pool_ids,
             interest_rate: interest_rate,
             pool_supply: 0,
             amount_borrowed: 0,
@@ -92,9 +86,10 @@ impl LendingContract {
             lastest_reward_time: env::block_timestamp(),
         };
         self.pools.push(&pool);
-        pool_id_by_collateral_token.insert(&collateral_token.clone().into(), &self.pool_count);
         self.pool_ids_by_lending_token
-            .insert(&lending_token.into(), &pool_id_by_collateral_token);
+            .insert(&lending_token.to_string(), &self.pool_count);
+        self.token_decimals
+            .insert(&lending_token.to_string(), &decimals);
         self.pool_count += 1;
     }
 
@@ -107,104 +102,195 @@ impl LendingContract {
             "Dont enough token to borrow from pool"
         );
         assert_one_yocto();
-        // Get pool if of Ref finance, then call method get_ref_pool_callback
-        if pool.collateral_token == WNEAR.to_string() {
-            ref_contract::get_pool(pool.ref_pool_ids[0], &REF_FINANCE, 0, 10_000_000_000_000).then(
-                self_contract::get_ref_pool_callback(
-                    pool_id,
-                    env::predecessor_account_id(),
-                    Balance::from(amount),
-                    &env::current_account_id(),
+        let all_loans = self.get_all_loans(&env::predecessor_account_id());
+        let all_deposits = self.get_all_deposits(&env::predecessor_account_id());
+        if all_loans.len() > 0 {
+            let mut promises: Promise = oracle_contract::get_data_response(
+                all_loans[0].lending_token.clone(),
+                &ORACLE,
+                0,
+                5_000_000_000_000,
+            );
+            for i in 1..all_loans.len() {
+                promises = promises.and(oracle_contract::get_data_response(
+                    all_loans[i].lending_token.clone(),
+                    &ORACLE,
                     0,
-                    50_000_000_000_000,
-                ),
-            )
-        } else {
-            ref_contract::get_pool(pool.ref_pool_ids[1], &REF_FINANCE, 0, 10_000_000_000_000)
-                .then(ref_contract::get_pool(
-                    pool.ref_pool_ids[0],
-                    &REF_FINANCE,
+                    5_000_000_000_000,
+                ));
+            }
+            for i in 0..all_deposits.len() {
+                promises = promises.and(oracle_contract::get_data_response(
+                    all_deposits[i].lending_token.clone(),
+                    &ORACLE,
                     0,
-                    10_000_000_000_000,
+                    5_000_000_000_000,
+                ));
+            }
+            promises
+                .and(oracle_contract::get_data_response(
+                    pool.lending_token.clone(),
+                    &ORACLE,
+                    0,
+                    5_000_000_000_000,
                 ))
-                .then(self_contract::get_ref_pool_callback(
-                    pool_id,
+                .then(self_contract::check_borrowable(
                     env::predecessor_account_id(),
-                    Balance::from(amount),
+                    pool_id,
+                    amount,
+                    all_loans,
+                    all_deposits,
                     &env::current_account_id(),
                     0,
-                    50_000_000_000_000,
+                    100_000_000_000_000,
+                ))
+        } else {
+            let mut promises: Promise = oracle_contract::get_data_response(
+                all_deposits[0].lending_token.clone(),
+                &ORACLE,
+                0,
+                5_000_000_000_000,
+            );
+            for i in 1..all_deposits.len() {
+                promises = promises.and(oracle_contract::get_data_response(
+                    all_deposits[i].lending_token.clone(),
+                    &ORACLE,
+                    0,
+                    5_000_000_000_000,
+                ));
+            }
+            promises
+                .and(oracle_contract::get_data_response(
+                    pool.lending_token.clone(),
+                    &ORACLE,
+                    0,
+                    5_000_000_000_000,
+                ))
+                .then(self_contract::check_borrowable(
+                    env::predecessor_account_id(),
+                    pool_id,
+                    amount,
+                    all_loans,
+                    all_deposits,
+                    &env::current_account_id(),
+                    0,
+                    100_000_000_000_000,
                 ))
         }
     }
 
-    // After get pool info of Ref finance contract, callback will calculate max amount borrowable of borrower
     #[private]
-    pub fn get_ref_pool_callback(
+    pub fn check_borrowable(
         &mut self,
-        pool_id: u64,
         borrower_id: AccountId,
-        amount: Balance,
-    ) -> PromiseOrValue<bool> {
-        if let PromiseResult::Successful(result_lending_token_pool) =
-            env::promise_result(env::promise_results_count() - 1)
-        {
-            let pool = &self.pools.get(pool_id).expect(ERR_NO_POOL);
-            let borrower = pool.borrowers.get(&borrower_id).expect(ERR_NO_BORROWER);
-            let mut amount_near = borrower.amount_collateral;
-            let lending_ref_pool =
-                serde_json::from_slice::<PoolInfo>(&result_lending_token_pool).unwrap();
-            //if collateral token is not wnear, get return amount: collateral token -> wnear -> lending token
-            if pool.collateral_token != WNEAR.to_string() {
-                if let PromiseResult::Successful(result_collateral_token_pool) =
-                    env::promise_result(env::promise_results_count() - 2)
-                {
-                    let collateral_ref_pool =
-                        serde_json::from_slice::<PoolInfo>(&result_collateral_token_pool).unwrap();
-                    amount_near = collateral_ref_pool.get_return(
-                        &pool.collateral_token,
-                        borrower.amount_collateral,
-                        &WNEAR.to_string(),
-                    );
-                } else {
-                    return PromiseOrValue::Value(false);
-                }
-            }
-            let max_amount =
-                lending_ref_pool.get_return(&WNEAR.to_string(), amount_near, &pool.lending_token)
-                    * MAX_BORROW_RATE
-                    / 100;
-            if max_amount > amount + borrower.amount {
-                //transfer token to borrower then update pool infomation
-                PromiseOrValue::from(
-                    ft_contract::ft_transfer(
-                        ValidAccountId::try_from(borrower_id.clone()).unwrap(),
-                        U128::from(amount),
-                        None,
-                        &pool.lending_token,
-                        1,
-                        15_000_000_000_000,
-                    )
-                    .then(self_contract::update_borrower(
-                        pool_id,
-                        borrower_id,
-                        U128::from(amount),
-                        &env::current_account_id(),
-                        0,
-                        10_000_000_000_000,
-                    )),
-                )
+        pool_id: u64,
+        amount: U128,
+        loans: Vec<Loan>,
+        deposits: Vec<LenderInfo>,
+    ) -> Promise {
+        let loans_len = loans.len() as u64;
+        let deposits_len = deposits.len() as u64;
+        let mut loan_value: u128 = 0;
+        let mut deposit_value: u128 = 0;
+        for i in 0..loans_len {
+            let price = LendingContract::process_data_response_get_price(env::promise_result(
+                env::promise_results_count() - loans_len - deposits_len - 1 + i,
+            ));
+            let decimals = self
+                .token_decimals
+                .get(&loans[i as usize].lending_token)
+                .unwrap() as u32;
+            loan_value +=
+                loans[i as usize].amount * price / PRICE_DIVISOR as u128 / 10u128.pow(decimals);
+        }
+
+        for i in 0..deposits_len {
+            let price = LendingContract::process_data_response_get_price(env::promise_result(
+                env::promise_results_count() - deposits_len - 1 + i,
+            ));
+            let decimals = self
+                .token_decimals
+                .get(&deposits[i as usize].lending_token)
+                .unwrap() as u32;
+            deposit_value +=
+                deposits[i as usize].share * price / PRICE_DIVISOR as u128 / 10u128.pow(decimals);
+        }
+        let pool = &self.pools.get(pool_id).expect(ERR_NO_POOL);
+
+        let price = LendingContract::process_data_response_get_price(env::promise_result(
+            env::promise_results_count() - 1,
+        ));
+        let decimals = self.token_decimals.get(&pool.lending_token).unwrap() as u32;
+        loan_value += u128::from(amount) * price / PRICE_DIVISOR as u128 / 10u128.pow(decimals);
+
+        assert!(loan_value <= deposit_value, "{}", ERR_BORROW_VALUE_LIMITED);
+
+        ft_contract::ft_transfer(
+            ValidAccountId::try_from(borrower_id.clone()).unwrap(),
+            amount,
+            None,
+            &pool.lending_token,
+            1,
+            15_000_000_000_000,
+        )
+        .then(self_contract::update_borrower(
+            pool_id,
+            borrower_id,
+            amount,
+            &env::current_account_id(),
+            0,
+            15_000_000_000_000,
+        ))
+    }
+
+    fn process_data_response_get_price(promise_result: PromiseResult) -> Balance {
+        if let PromiseResult::Successful(result) = promise_result {
+            if let Ok(response) = near_sdk::serde_json::from_slice::<Response>(&result) {
+                assert!(
+                    env::block_timestamp() - response.timestamp < ORACLE_DATA_EXPIRATION,
+                    "{}",
+                    ERR_ORACLE_DATA_EXPIRED
+                );
+                (response.result.parse::<f64>().unwrap() * PRICE_DIVISOR) as u128
             } else {
-                PromiseOrValue::Value(false)
+                env::panic(WRONG_FORMAT_PROMISE_RESULT);
             }
         } else {
-            PromiseOrValue::Value(false)
+            env::panic(PROMISE_NOT_SUCCESSFUL);
         }
+    }
+
+    fn get_all_deposits(&self, user: &AccountId) -> Vec<LenderInfo> {
+        self.pools
+            .iter()
+            .filter_map(|pool| {
+                if let Some(mut deposit) = pool.lenders.get(user) {
+                    deposit.share += pool.amount_claimable(user);
+                    Some(deposit)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn get_all_loans(&self, borrower_id: &AccountId) -> Vec<Loan> {
+        self.pools
+            .iter()
+            .filter_map(|pool| {
+                if let Some(mut loan) = pool.borrowers.get(borrower_id) {
+                    loan.amount += pool.get_interest(&loan);
+                    Some(loan)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     // Update pool information after transfer lending token to borrower
     #[private]
-    pub fn update_borrower(&mut self, pool_id: u64, borrower: AccountId, amount: U128) -> bool {
+    pub fn update_borrower(&mut self, pool_id: u64, borrower: &AccountId, amount: U128) -> bool {
         let mut pool = self.pools.get(pool_id).expect(ERR_NO_POOL);
 
         log!(
@@ -229,86 +315,9 @@ impl LendingContract {
         pool_id: u64,
         amount: Balance,
         borrower_id: AccountId,
-    ) -> PromiseOrValue<U128> {
+    ) {
         let pool = self.pools.get(pool_id).expect(ERR_NO_POOL);
         // get Ref finance pool to calculate amount collateral token out
-        let mut ref_pool: Vec<PoolInfo> = Vec::new();
-        if pool.collateral_token != WNEAR.to_string() {
-            match env::promise_result(env::promise_results_count() - 2) {
-                PromiseResult::Successful(collateral_token_pool) => {
-                    ref_pool.push(
-                        near_sdk::serde_json::from_slice::<PoolInfo>(&collateral_token_pool)
-                            .expect(ERR_REF_POOL),
-                    );
-                }
-                _ => {
-                    return PromiseOrValue::Value(U128::from(amount));
-                }
-            }
-        }
-        match env::promise_result(env::promise_results_count() - 1) {
-            PromiseResult::Successful(lending_token_pool) => {
-                ref_pool.push(
-                    near_sdk::serde_json::from_slice::<PoolInfo>(&lending_token_pool)
-                        .expect(ERR_REF_POOL),
-                );
-            }
-            _ => {
-                return PromiseOrValue::Value(U128::from(amount));
-            }
-        }
-        // Check if borrower asset is liquidatable, if false, return (amount, 0)
-        // Max amount rate to liquidate is 50%, if liquidator deposit amount is greater than max amount
-        // refund remain amount in ft_on_resolve
-        let (remain_amount, amount_collateral_out) =
-            pool.calculate_liquidatable(borrower_id.clone(), amount, ref_pool);
-        // if amount collateral token out =0, asset of borrower is not liquidatable
-        if amount_collateral_out == 0 {
-            PromiseOrValue::Value(U128::from(remain_amount))
-        } else {
-            // Transfer asset of borrower to liquidator then update info
-            PromiseOrValue::from(
-                ft_contract::ft_transfer(
-                    ValidAccountId::try_from(liquidator.clone()).unwrap(),
-                    U128::from(amount_collateral_out),
-                    None,
-                    &pool.collateral_token,
-                    1,
-                    10_000_000_000_000,
-                )
-                .then(self_contract::liquidate_callback(
-                    pool_id,
-                    amount,
-                    remain_amount,
-                    amount_collateral_out,
-                    borrower_id,
-                    &env::current_account_id(),
-                    0,
-                    20_000_000_000_000,
-                )),
-            )
-        }
-    }
-
-    // After liquidate asset of borrower, update pool infomation
-    #[private]
-    pub fn liquidate_callback(
-        &mut self,
-        pool_id: u64,
-        amount_deposit: Balance,
-        remain_amount: Balance,
-        amount_collateral_out: Balance,
-        borrower_id: AccountId,
-    ) -> PromiseOrValue<U128> {
-        match env::promise_result(env::promise_results_count() - 1) {
-            PromiseResult::Successful(_) => {
-                let mut pool = self.pools.get(pool_id).expect(ERR_NO_POOL);
-                pool.liquidate(borrower_id, amount_deposit, amount_collateral_out);
-                self.pools.replace(pool_id, &pool);
-                PromiseOrValue::Value(U128::from(remain_amount))
-            }
-            _ => PromiseOrValue::Value(U128::from(amount_deposit)),
-        }
     }
 
     // Claim reward of lender
@@ -321,9 +330,22 @@ impl LendingContract {
             self.get_amount_claimable(pool_id, env::predecessor_account_id())
         );
         let mut pool = self.pools.get(pool_id).expect(ERR_NO_POOL);
-        let result = pool.claim_reward(env::predecessor_account_id());
-        self.pools.replace(pool_id, &pool);
-        result
+        let amount_claimable = pool.amount_claimable(&env::predecessor_account_id());
+        ft_contract::ft_transfer(
+            ValidAccountId::try_from(env::predecessor_account_id()).unwrap(),
+            U128::from(amount_claimable),
+            None,
+            &pool.lending_token,
+            1,
+            10_000_000_000_000,
+        )
+        .then(self_contract::check_claim_success(
+            pool_id,
+            env::predecessor_account_id(),
+            &env::current_account_id(),
+            0,
+            10_000_000_000_000,
+        ))
     }
 
     // Withdraw reward of lender, amount return = amount want to withdraw + reward
@@ -337,27 +359,50 @@ impl LendingContract {
             self.get_amount_claimable(pool_id, env::predecessor_account_id())
         );
         let mut pool = self.pools.get(pool_id).expect(ERR_NO_POOL);
-        let result = pool.withdraw(env::predecessor_account_id(), amount.into());
-        self.pools.replace(pool_id, &pool);
-        result
+        let interest = pool.amount_claimable(&env::predecessor_account_id());
+        ft_contract::ft_transfer(
+            ValidAccountId::try_from(env::predecessor_account_id()).unwrap(),
+            U128::from(u128::from(amount) + interest),
+            None,
+            &pool.lending_token,
+            1,
+            10_000_000_000_000,
+        )
+        .then(self_contract::check_withdraw_success(
+            pool_id,
+            env::predecessor_account_id(),
+            U128::from(amount),
+            U128::from(interest),
+            &env::current_account_id(),
+            0,
+            10_000_000_000_000,
+        ))
     }
 
     // Update pool information after claim reward
     #[private]
     pub fn check_claim_success(&mut self, pool_id: u64, lender: AccountId) {
-        if let PromiseResult::Successful(_) = env::promise_result(0) {
+        if let PromiseResult::Successful(_) = env::promise_result(env::promise_results_count() - 1)
+        {
             let mut pool = self.pools.get(pool_id).expect(ERR_NO_POOL);
-            pool.update_lender_claim(lender);
+            pool.claim(lender);
             self.pools.replace(pool_id, &pool);
         }
     }
 
     // Update pool information after withdraw
     #[private]
-    pub fn check_withdraw_success(&mut self, pool_id: u64, lender: AccountId, amount: U128) {
-        if let PromiseResult::Successful(_) = env::promise_result(0) {
+    pub fn check_withdraw_success(
+        &mut self,
+        pool_id: u64,
+        lender: AccountId,
+        amount: U128,
+        interest: U128,
+    ) {
+        if let PromiseResult::Successful(_) = env::promise_result(env::promise_results_count() - 1)
+        {
             let mut pool = self.pools.get(pool_id).expect(ERR_NO_POOL);
-            pool.update_lender_withdraw(lender, Balance::from(amount));
+            pool.withdraw(lender, Balance::from(amount), Balance::from(interest));
             self.pools.replace(pool_id, &pool);
         }
     }
@@ -379,8 +424,6 @@ impl FungibleTokenReceiver for LendingContract {
                 let pool_id = self
                     .pool_ids_by_lending_token
                     .get(&env::predecessor_account_id()) // lending token
-                    .expect(ERR_NO_POOL)
-                    .get(&transfer_payload.token) // collateral token
                     .expect(ERR_NO_POOL);
                 assert_eq!(pool_id, transfer_payload.pool_id, "pool id: not good");
                 log!(
@@ -401,8 +444,6 @@ impl FungibleTokenReceiver for LendingContract {
                 let pool_id = self
                     .pool_ids_by_lending_token
                     .get(&env::predecessor_account_id()) // Lending token
-                    .expect(ERR_NO_POOL)
-                    .get(&transfer_payload.token) // Collateral token
                     .expect(ERR_NO_POOL);
                 assert_eq!(pool_id, transfer_payload.pool_id, "pool id: not good");
                 log!(
@@ -418,27 +459,6 @@ impl FungibleTokenReceiver for LendingContract {
                 self.pools.replace(pool_id, &pool);
                 PromiseOrValue::Value(U128::from(refund))
             }
-            // Deposit collateral token to pool to borrow lending token
-            TransferType::Mortgage => {
-                let pool_id = self
-                    .pool_ids_by_lending_token
-                    .get(&transfer_payload.token) // Lending token
-                    .expect(ERR_NO_POOL)
-                    .get(&env::predecessor_account_id()) // Collateral token
-                    .expect(ERR_NO_POOL);
-                log!(
-                    "{} mortgaged {} token {} to pool {}",
-                    sender_id,
-                    Balance::from(amount),
-                    env::predecessor_account_id(),
-                    pool_id
-                );
-                assert_eq!(pool_id, transfer_payload.pool_id, "pool id: not good");
-                let mut pool = self.pools.get(pool_id).expect(ERR_NO_POOL);
-                pool.mortgage(sender_id.into(), Balance::from(amount));
-                self.pools.replace(pool_id, &pool);
-                PromiseOrValue::Value(U128::from(0))
-            }
             // When price decreases to lower than liquidation threshold,
             // other user can become liquidator to liquidate asset of borrower.
             // Transfer lending token to liquidate borrower's asset and get 5% more as Liquidator incentive
@@ -447,62 +467,15 @@ impl FungibleTokenReceiver for LendingContract {
                 let pool_id = self
                     .pool_ids_by_lending_token
                     .get(&env::predecessor_account_id())
-                    .expect(ERR_NO_POOL)
-                    .get(&transfer_payload.token)
                     .expect(ERR_NO_POOL);
                 assert_eq!(pool_id, transfer_payload.pool_id, "pool id: not good");
                 let pool = self.pools.get(pool_id).expect(ERR_NO_POOL);
                 // User ref finance as a source of pricing information,
                 // collateral token- wnear, lending token - wnear.
                 // Because Near have not had an oracle yet.
-
+                PromiseOrValue::Value(U128::from(0))
                 // If collater token is wnear, no need to use wnear as intermediate token
                 // Get pool to check and calculate amount liquidate
-                if pool.collateral_token == WNEAR.to_string() {
-                    PromiseOrValue::from(
-                        ref_contract::get_pool(
-                            pool.ref_pool_ids[0],
-                            &REF_FINANCE,
-                            0,
-                            8_000_000_000_000,
-                        )
-                        .then(self_contract::liquidate(
-                            sender_id.into(),
-                            transfer_payload.pool_id,
-                            Balance::from(amount),
-                            borrower,
-                            &env::current_account_id(),
-                            0,
-                            50_000_000_000_000,
-                        )),
-                    )
-                } else {
-                    // Use wnear as intermediate token
-                    // Get pool to check and calculate amount liquidate
-                    PromiseOrValue::from(
-                        ref_contract::get_pool(
-                            pool.ref_pool_ids[0],
-                            &REF_FINANCE,
-                            0,
-                            8_000_000_000_000,
-                        )
-                        .then(ref_contract::get_pool(
-                            pool.ref_pool_ids[1],
-                            &REF_FINANCE,
-                            0,
-                            8_000_000_000_000,
-                        ))
-                        .then(self_contract::liquidate(
-                            sender_id.into(),
-                            transfer_payload.pool_id,
-                            Balance::from(amount),
-                            borrower,
-                            &env::current_account_id(),
-                            0,
-                            50_000_000_000_000,
-                        )),
-                    )
-                }
             }
         }
     }
@@ -524,7 +497,6 @@ pub struct Metadata {
 pub struct PoolMetadata {
     pub pool_id: u64,
     pub lending_token: AccountId,
-    pub collateral_token: AccountId,
     pub interest_rate: u64,
     pub pool_supply: Balance,
     pub amount_borrowed: Balance,
