@@ -52,6 +52,13 @@ impl LendingContract {
             .expect("ERR_NO_BORROWER")
     }
 
+    pub fn get_interest(&self, pool_id: u64, borrower_id: AccountId) -> Balance {
+        self.pools
+            .get(pool_id)
+            .expect(ERR_NO_POOL)
+            .get_interest(&self.get_loan(pool_id, borrower_id))
+    }
+
     pub fn get_lender(&self, pool_id: u64, lender_id: AccountId) -> LenderInfo {
         self.pools
             .get(pool_id)
